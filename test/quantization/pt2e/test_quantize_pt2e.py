@@ -97,6 +97,29 @@ class PT2EQuantizationTestCase(QuantizationTestCase):
         torch.ops.quantized_decomposed.dequantize_per_tensor.tensor: torch.ops.quantized_decomposed.dequantize_per_tensor.tensor,
     }
 
+    def _get_pt2e_quantized_linear(self) -> torch.fx.GraphModule:
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        quantizer = XNNPACKQuantizer()
+        operator_config = get_symmetric_quantization_config(is_per_channel=False)
+        quantizer.set_global(operator_config)
+        example_inputs = (torch.randn(2, 2),)
+        m = M().eval()
+        m = capture_pre_autograd_graph(
+            m,
+            example_inputs,
+        )
+        m = prepare_pt2e(m, quantizer)
+        # Calibrate
+        m(*example_inputs)
+        m = convert_pt2e(m)
+        return m
 
     def _test_quantizer(
         self,
@@ -1132,6 +1155,101 @@ class TestQuantizePT2E(PT2EQuantizationTestCase):
             node_list,
         )
 
+    def test_fold_quantize(self):
+        """Test to make sure the quantized model gets quantized weight (quantize op is folded)
+        """
+        m = self._get_pt2e_quantized_linear()
+        node_occurrence = {
+            # quantize op for weight node is folded
+            ns.call_function(torch.ops.quantized_decomposed.quantize_per_tensor.default): 2,
+            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_tensor.default): 3,
+        }
+        self.checkGraphModuleNodes(m, expected_node_occurrence=node_occurrence)
+
+    def test_dont_fold_other_constant(self):
+        """Make sure the constant propagation does not apply to things unrelated to
+        quantization
+        """
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2)
+                self.dont_fold_me = torch.randn(2, 2)
+
+            def forward(self, x):
+                t = self.dont_fold_me.t()
+                return self.linear(x) + t
+
+        quantizer = XNNPACKQuantizer()
+        operator_config = get_symmetric_quantization_config(is_per_channel=False)
+        # only quantize linear, so add add is not quantized and the constant Tensor
+        # should not be folded
+        quantizer.set_module_type(torch.nn.Linear, operator_config)
+        example_inputs = (torch.randn(2, 2),)
+        m = M().eval()
+        m = capture_pre_autograd_graph(
+            m,
+            example_inputs,
+        )
+        m = prepare_pt2e(m, quantizer)
+        # Calibrate
+        m(*example_inputs)
+        m = convert_pt2e(m)
+        node_occurrence = {
+            # quantize op for weight node is folded
+            ns.call_function(torch.ops.quantized_decomposed.quantize_per_tensor.default): 2,
+            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_tensor.default): 3,
+            # transpose op not folded
+            ns.call_function(torch.ops.aten.t.default): 1,
+        }
+        self.checkGraphModuleNodes(m, expected_node_occurrence=node_occurrence)
+
+    def test_fold_all_ops_before_quantize(self):
+        """Test folding all ops that's before quantized operator:
+        Before:
+            get_attr(weight) -> transpose -> quantize -> dequantize
+        After:
+            get_attr(folded_weight) -> dequantize
+        """
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.randn(2, 2)
+
+            def forward(self, x):
+                t = self.weight.t()
+                return torch.nn.functional.linear(x, t)
+
+        quantizer = XNNPACKQuantizer()
+        operator_config = get_symmetric_quantization_config(is_per_channel=False)
+        # only quantize linear, so add add is not quantized and the constant Tensor
+        # should not be folded
+        quantizer.set_global(operator_config)
+        example_inputs = (torch.randn(2, 2),)
+        m = M().eval()
+        m = capture_pre_autograd_graph(
+            m,
+            example_inputs,
+        )
+        m = prepare_pt2e(m, quantizer)
+        # Calibrate
+        m(*example_inputs)
+        m = convert_pt2e(m)
+        node_occurrence = {
+            # quantize op for weight node is folded
+            ns.call_function(torch.ops.quantized_decomposed.quantize_per_tensor.default): 2,
+            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_tensor.default): 3,
+        }
+        self.checkGraphModuleNodes(m, expected_node_occurrence=node_occurrence)
+
+    def test_constant_prop_preserve_metadata(self):
+        """Test to make sure the quantized model gets quantized weight (quantize op is folded)
+        """
+        m = self._get_pt2e_quantized_linear()
+        for n in m.graph.nodes:
+            if n.op == "get_attr" and "frozen_param" in n.target:
+                self.assertIn("stack_trace", n.meta)
+
     def test_add_and_inplace_add(self):
         quantizer = XNNPACKQuantizer()
         quantization_config = get_symmetric_quantization_config(is_per_channel=True)
@@ -1162,27 +1280,7 @@ class TestQuantizePT2E(PT2EQuantizationTestCase):
     def test_save_load(self):
         """Test save/load a quantized model
         """
-        class M(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.linear = torch.nn.Linear(2, 2)
-
-            def forward(self, x):
-                return self.linear(x)
-
-        quantizer = XNNPACKQuantizer()
-        operator_config = get_symmetric_quantization_config(is_per_channel=False)
-        quantizer.set_global(operator_config)
-        example_inputs = (torch.randn(2, 2),)
-        m = M().eval()
-        m = capture_pre_autograd_graph(
-            m,
-            example_inputs,
-        )
-        m = prepare_pt2e(m, quantizer)
-        # Calibrate
-        m(*example_inputs)
-        m = convert_pt2e(m)
+        m = self._get_pt2e_quantized_linear()
         ref_res = m(*example_inputs)
 
         with TemporaryFileName() as fname:
