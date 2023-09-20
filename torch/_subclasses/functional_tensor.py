@@ -29,8 +29,36 @@ class FunctionalTensor(torch.Tensor):
     # this is an "infra" mode with lower dispatching precedence.
     _mode_key = torch._C._TorchDispatchModeKey.FUNCTIONAL
 
+    # Note: FunctionalTensor is not quite like the functorch wrapper subclasses,
+    # because today functionalization runs *below* the conj/neg/zero dispatch keys.
+    # We could consider changing this to make it more inline with functorch.
+    _extra_dispatch_keys = torch._C._additional_keys_to_prop_for_wrapper_tensors.add(
+        torch._C.DispatchKey.ZeroTensor
+    )
+
     def __new__(cls, elem):
         assert torch._is_functional_tensor(elem)
+
+        # In general, we'd like our functional tensor subclass to only be in charge of functionalization,
+        # and defer to the inner subclass for all other functionality.
+        # Example: If our inner tensor is a ZeroTensor, we would want to defer running the ZeroTensor fallback
+        # until after we redispatch to our inner ZeroTensor.
+        # However, there are a few keys that we need to mirror between the inner and outer tensors.
+        #   Conjugate
+        #   Negative
+        # Why? These keys are used to test metadata queries, like `.is_conj()` and `.is_neg()`.
+        # We **need** calls to is_conj() to return the same thing on the outer and inner tensors,
+        # Because user code / framework code that branches like so needs to do the same thing
+        # when it sees the outer FunctionalTensor:
+        #     if (x.is_conj()) {
+        #         return at::view_as_real(x.resolve_conj());
+        #     } else {
+        #         return at::view_as_real(x);
+        #     }
+        extra_dispatch_keys = (
+            FunctionalTensor._extra_dispatch_keys & torch._C._dispatch_keys(elem)
+        )
+
         out = torch.Tensor._make_wrapper_subclass(  # type: ignore[arg-type, attr-defined]
             # TODO: right now, _make_wrapper_subclass's dynamic shape interaction is not great.
             # Calling the overload that has kwargs causes us to go down the first overload path,
@@ -47,6 +75,9 @@ class FunctionalTensor(torch.Tensor):
             False,  # pin_memory
             elem.requires_grad,  # requires_grad
             "sizes",  # dispatch_sizes_strides_policy
+            False,  # dispatch_device
+            False,  # dispatch_layout
+            extra_dispatch_keys,  # _extra_dispatch_keys
         )
         out.elem = elem
         return out
@@ -147,6 +178,7 @@ class FunctionalTensorMode(TorchDispatchMode):
             is None
         ):
             self.enter_stack.append(True)
+
             return super().__enter__()
         else:
             self.enter_stack.append(False)
@@ -205,11 +237,19 @@ class FunctionalTensorMode(TorchDispatchMode):
             torch._C.DispatchKey.Functionalize
         )
         assert is_excluded or not is_included
+        include_to_set = (
+            torch._C._dispatch_tls_local_include_set()
+            | torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
+        )
+        exclude_to_set = (
+            torch._C._dispatch_tls_local_exclude_set().remove(
+                torch._C.DispatchKey.Functionalize
+            )
+            - FunctionalTensor._extra_dispatch_keys
+        )
         # All we want to do here is re-use the existing C++ functionalization logic.
         # This requires swizzling our TLS dispatch keys so that the Functionalize key is active.
-        with torch._C._SetExcludeDispatchKeyGuard(
-            torch._C.DispatchKey.Functionalize, False
-        ), torch._C._IncludeDispatchKeyGuard(torch._C.DispatchKey.Functionalize):
+        with torch._C._ForceDispatchKeyGuard(include_to_set, exclude_to_set):
             try:
                 # By default for python functionalization (for AOTAutograd), we reapply views.
                 old_apply_views = torch._functionalize_enable_reapply_views(True)
