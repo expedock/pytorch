@@ -6,7 +6,6 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import sympy
 
 import torch
-import torch.fx._pytree as fx_pytree
 import torch.utils._pytree as pytree
 from torch.fx._compatibility import compatibility
 
@@ -344,12 +343,10 @@ class ExportedProgram:
         from torch._export import combine_args_kwargs
 
         if self.call_spec.in_spec is not None:
-            try:
-                user_args = combine_args_kwargs(args, kwargs)
-                args = fx_pytree.tree_flatten_spec(user_args, self.call_spec.in_spec)  # type: ignore[assignment]
-            except Exception:
-                _, received_spec = pytree.tree_flatten(user_args)
-                raise error.InternalError(
+            user_args = combine_args_kwargs(args, kwargs)
+            args, received_spec = pytree.tree_flatten(user_args)  # type: ignore[assignment]
+            if received_spec != self.call_spec.in_spec:
+                raise TypeError(
                     "Trying to flatten user inputs with exported input tree spec: \n"
                     f"{self.call_spec.in_spec}\n"
                     "but actually got inputs with tree spec of: \n"
