@@ -7,8 +7,8 @@
 #
 #       For reference:
 #           https://docs.docker.com/develop/develop-images/build_enhancements/
-ARG BASE_IMAGE=ubuntu:18.04
-ARG PYTHON_VERSION=3.8
+ARG BASE_IMAGE=ubuntu:22.04
+ARG PYTHON_VERSION=3.10.4
 
 FROM ${BASE_IMAGE} as dev-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,7 +26,7 @@ RUN mkdir /opt/ccache && ccache --set-config=cache_dir=/opt/ccache
 ENV PATH /opt/conda/bin:$PATH
 
 FROM dev-base as conda
-ARG PYTHON_VERSION=3.8
+ARG PYTHON_VERSION=3.10.4
 # Automatically set by buildx
 ARG TARGETPLATFORM
 # translating Docker's TARGETPLATFORM into miniconda arches
@@ -43,6 +43,7 @@ RUN chmod +x ~/miniconda.sh && \
     /opt/conda/bin/conda install -y python=${PYTHON_VERSION} cmake conda-build pyyaml numpy ipython && \
     /opt/conda/bin/python -mpip install -r requirements.txt && \
     /opt/conda/bin/conda clean -ya
+RUN /opt/conda/bin/conda install -c nvidia cuda-toolkit
 
 FROM dev-base as submodule-update
 WORKDIR /opt/pytorch
@@ -54,12 +55,16 @@ WORKDIR /opt/pytorch
 COPY --from=conda /opt/conda /opt/conda
 COPY --from=submodule-update /opt/pytorch /opt/pytorch
 RUN --mount=type=cache,target=/opt/ccache \
-    TORCH_CUDA_ARCH_LIST="3.5 5.2 6.0 6.1 7.0+PTX 8.0" TORCH_NVCC_FLAGS="-Xfatbin -compress-all" \
+    # 7.5 for Franz' RTX 2060 GPU and 8.6 for the A10G GPUs in the ml.g5.* instances
+    # +PTX for forward compatibility
+    TORCH_CUDA_ARCH_LIST="7.5;8.6+PTX" TORCH_NVCC_FLAGS="-Xfatbin -compress-all" \
     CMAKE_PREFIX_PATH="$(dirname $(which conda))/../" \
+    LDFLAGS="-L/opt/conda/lib/ $LDFLAGS" \
+    BUILD_TEST=0 USE_DISTRIBUTED=0 \
     python setup.py install
 
 FROM conda as conda-installs
-ARG PYTHON_VERSION=3.8
+ARG PYTHON_VERSION=3.10.4
 ARG CUDA_VERSION=11.7
 ARG CUDA_CHANNEL=nvidia
 ARG INSTALL_CHANNEL=pytorch-nightly
@@ -77,7 +82,7 @@ RUN case ${TARGETPLATFORM} in \
 RUN /opt/conda/bin/pip install torchelastic
 
 FROM ${BASE_IMAGE} as official
-ARG PYTORCH_VERSION
+ARG PYTORCH_VERSION=2.0.1
 ARG TRITON_VERSION
 ARG TARGETPLATFORM
 ARG CUDA_VERSION
@@ -101,3 +106,4 @@ WORKDIR /workspace
 FROM official as dev
 # Should override the already installed version from the official-image stage
 COPY --from=build /opt/conda /opt/conda
+COPY --from=build /opt/pytorch /opt/pytorch

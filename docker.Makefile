@@ -10,15 +10,15 @@ endif
 
 CUDA_VERSION              = 11.7.0
 CUDNN_VERSION             = 8
-BASE_RUNTIME              = ubuntu:18.04
-BASE_DEVEL                = nvidia/cuda:$(CUDA_VERSION)-cudnn$(CUDNN_VERSION)-devel-ubuntu18.04
+BASE_RUNTIME              = ubuntu:22.04
+BASE_DEVEL                = nvidia/cuda:$(CUDA_VERSION)-cudnn$(CUDNN_VERSION)-devel-ubuntu22.04
 
 # The conda channel to use to install cudatoolkit
 CUDA_CHANNEL              = nvidia
 # The conda channel to use to install pytorch / torchvision
 INSTALL_CHANNEL          ?= pytorch
 
-PYTHON_VERSION           ?= 3.10
+PYTHON_VERSION           ?= 3.10.4
 PYTORCH_VERSION          ?= $(shell git describe --tags --always)
 # Can be either official / dev
 BUILD_TYPE               ?= dev
